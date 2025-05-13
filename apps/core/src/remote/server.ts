@@ -1,15 +1,17 @@
+// apps/core/src/remote/server.ts
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import { logger } from '../utils/logger.js';
-import { getAssistantResponse, streamAssistantResponse } from '../ai/llm.js';
+import { getAssistantResponse } from '../ai/llm.js';
 import { authenticate } from '../security/auth.js';
 import { 
   initializeConversationManager,
   processConversationMessage,
   addConversationResource
 } from '../ai/conversation.js';
+import { executeAgentLoop, streamAgentLoop } from '../ai/agentLoop.js';
 
 // Define proper types for the server and io instances
 let io: Server;
@@ -66,42 +68,47 @@ export async function startServer(port: number, host: string): Promise<void> {
         
         const actualConversationId = conversationId || `api-stream-${Date.now()}`;
         
-        // Process the message in the conversation context (for history)
-        if (conversationId) {
-          await processConversationMessage(actualConversationId, message);
-        }
-        
+        // Set up streaming headers
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         
-        const stream = await streamAssistantResponse(message);
-        
-        // Pass the stream to the response
-        const reader = stream.getReader();
-        
-        const processStream = async () => {
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              
-              if (done) {
-                res.write('event: done\ndata: {}\n\n');
-                res.end();
-                break;
-              }
-              
-              const chunk = new TextDecoder().decode(value);
-              res.write(`data: ${JSON.stringify({ text: chunk, conversationId: actualConversationId })}\n\n`);
+        // Use the streaming agent loop with callbacks
+        await streamAgentLoop(message, 10, {
+          onText: (text) => {
+            res.write(`data: ${JSON.stringify({ type: 'text', content: text, conversationId: actualConversationId })}\n\n`);
+          },
+          onToolCall: (toolName, args) => {
+            res.write(`data: ${JSON.stringify({ type: 'tool-call', toolName, args, conversationId: actualConversationId })}\n\n`);
+            
+            if (conversationId) {
+              addConversationResource(actualConversationId, 'toolResult', {
+                toolName, 
+                args,
+                result: null // We don't have the result yet
+              });
             }
-          } catch (error) {
-            logger.error('Error processing stream:', error);
-            res.write(`event: error\ndata: ${JSON.stringify({ error: 'Stream processing error' })}\n\n`);
+          },
+          onToolResult: (result) => {
+            res.write(`data: ${JSON.stringify({ type: 'tool-result', result, conversationId: actualConversationId })}\n\n`);
+            
+            if (conversationId) {
+              addConversationResource(actualConversationId, 'toolResult', {
+                toolName: result.toolName,
+                args: result.args,
+                result: result.result
+              });
+            }
+          },
+          onComplete: (finalText) => {
+            res.write(`event: done\ndata: ${JSON.stringify({ text: finalText, conversationId: actualConversationId })}\n\n`);
             res.end();
           }
-        };
-        
-        processStream();
+        }).catch(error => {
+          logger.error('Error in streaming agent loop:', error);
+          res.write(`event: error\ndata: ${JSON.stringify({ error: 'Stream processing error' })}\n\n`);
+          res.end();
+        });
       } catch (error) {
         logger.error('Error initializing stream:', error);
         return res.status(500).json({ error: 'Failed to initialize stream' });
@@ -113,18 +120,51 @@ export async function startServer(port: number, host: string): Promise<void> {
       
       socket.on('message', async (data) => {
         try {
-          const { message, conversationId, timestamp } = data;
+          const { message, conversationId } = data;
           const actualConversationId = conversationId || `socket-${socket.id}-${Date.now()}`;
           
           logger.info(`Message from client ${socket.id} (conversation: ${actualConversationId}): ${message}`);
           
-          const response = await processConversationMessage(actualConversationId, message);
-          
-          socket.emit('response', { 
-            response,
-            conversationId: actualConversationId,
-            timestamp: Date.now()
-          });
+          // Set up streaming with Socket.IO
+          try {
+            await streamAgentLoop(message, 10, {
+              onText: (text) => {
+                socket.emit('text', { text, conversationId: actualConversationId });
+              },
+              onToolCall: (toolName, args) => {
+                socket.emit('tool-call', { toolName, args, conversationId: actualConversationId });
+                
+                if (conversationId) {
+                  addConversationResource(actualConversationId, 'toolResult', {
+                    toolName, 
+                    args,
+                    result: null // We don't have the result yet
+                  });
+                }
+              },
+              onToolResult: (result) => {
+                socket.emit('tool-result', { result, conversationId: actualConversationId });
+                
+                if (conversationId) {
+                  addConversationResource(actualConversationId, 'toolResult', {
+                    toolName: result.toolName,
+                    args: result.args,
+                    result: result.result
+                  });
+                }
+              },
+              onComplete: (finalText) => {
+                socket.emit('response', { 
+                  response: finalText,
+                  conversationId: actualConversationId,
+                  timestamp: Date.now()
+                });
+              }
+            });
+          } catch (error) {
+            logger.error('Error in streaming agent loop:', error);
+            socket.emit('error', { error: 'Stream processing error' });
+          }
           
         } catch (error) {
           logger.error('Error handling socket message:', error);

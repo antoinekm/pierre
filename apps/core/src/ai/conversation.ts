@@ -1,12 +1,6 @@
+// apps/core/src/ai/conversation.ts
 import { logger } from '../utils/logger.js';
-import { openai } from '@ai-sdk/openai';
-import { generateText } from 'ai';
-import { SystemPrompt } from './prompt.js';
-import { computerTools } from './tools.js';
-import { captureScreen } from '../screen/capture.js';
-import { resizeScreenshot, getScreenshotBase64 } from '../screen/analyze.js';
-import fs from 'fs';
-import path from 'path';
+import { executeAgentLoop } from './agentLoop.js';
 
 type ConversationMessage = {
   role: 'user' | 'assistant';
@@ -14,17 +8,28 @@ type ConversationMessage = {
   timestamp: number;
 };
 
+type ToolResult = {
+  toolName: string;
+  args: Record<string, any>;
+  result: any;
+  timestamp: number;
+};
+
+type Screenshot = {
+  path: string;
+  timestamp: number;
+  description?: string;
+};
+
 type Conversation = {
   id: string;
   messages: ConversationMessage[];
   lastActivity: number;
   resources: {
-    screenshots?: {
-      path: string;
-      timestamp: number;
-      description?: string;
-    }[];
+    screenshots: Screenshot[];
+    toolResults: ToolResult[];
   };
+  context: Record<string, any>;
 };
 
 const conversations = new Map<string, Conversation>();
@@ -59,8 +64,10 @@ export function getOrCreateConversation(conversationId: string): Conversation {
       messages: [],
       lastActivity: Date.now(),
       resources: {
-        screenshots: []
-      }
+        screenshots: [],
+        toolResults: []
+      },
+      context: {}
     };
     conversations.set(conversationId, conversation);
     logger.info(`Created new conversation: ${conversationId}`);
@@ -71,23 +78,26 @@ export function getOrCreateConversation(conversationId: string): Conversation {
 
 export function addConversationResource(
   conversationId: string, 
-  resourceType: 'screenshot', 
+  resourceType: 'screenshot' | 'toolResult', 
   resource: any
 ): void {
   const conversation = getOrCreateConversation(conversationId);
   
   if (resourceType === 'screenshot') {
-    if (!conversation.resources.screenshots) {
-      conversation.resources.screenshots = [];
-    }
-    
     conversation.resources.screenshots.push({
       path: resource.path,
       timestamp: Date.now(),
-      description: resource.description
+      description: resource.description || 'Screenshot'
     });
     
     logger.info(`Added screenshot to conversation ${conversationId}: ${resource.path}`);
+  } else if (resourceType === 'toolResult') {
+    conversation.resources.toolResults.push({
+      ...resource,
+      timestamp: Date.now()
+    });
+    
+    logger.info(`Added tool result to conversation ${conversationId}: ${resource.toolName}`);
   }
   
   conversation.lastActivity = Date.now();
@@ -111,6 +121,19 @@ export function addConversationMessage(
   logger.info(`Added ${role} message to conversation ${conversationId}`);
 }
 
+export function updateConversationContext(
+  conversationId: string,
+  key: string,
+  value: any
+): void {
+  const conversation = getOrCreateConversation(conversationId);
+  
+  conversation.context[key] = value;
+  conversation.lastActivity = Date.now();
+  
+  logger.info(`Updated conversation context ${conversationId}: ${key}`);
+}
+
 export async function processConversationMessage(
   conversationId: string,
   userMessage: string
@@ -120,55 +143,46 @@ export async function processConversationMessage(
   addConversationMessage(conversationId, 'user', userMessage);
   
   try {
-    // Automatically capture screenshot before responding
-    const screenshotInfo = await captureAutomaticScreenshot(conversationId);
+    // Build context from previous messages
+    let contextPrompt = userMessage;
     
-    let contextPrompt = '';
-    
-    // Format recent conversation history
+    // Include relevant previous messages if available
     const recentMessages = conversation.messages.slice(-10);
     if (recentMessages.length > 1) {
-      contextPrompt = recentMessages
+      const previousExchange = recentMessages
         .slice(0, -1)
         .map(msg => `${msg.role === 'user' ? 'User' : 'You'}: ${msg.content}`)
         .join('\n\n');
         
-      contextPrompt += '\n\n';
+      contextPrompt = `Previous conversation:\n${previousExchange}\n\nNew request: ${userMessage}`;
     }
     
-    contextPrompt += `User: ${userMessage}\n\nYou:`;
+    // If we have information about the last known state, include it
+    if (conversation.context.lastKnownState) {
+      contextPrompt = `${contextPrompt}\n\nPrevious screen state: ${conversation.context.lastKnownState}`;
+    }
     
-    // Prepare image data for the model
-    const screenshotPath = screenshotInfo.resizedScreenshotPath;
-    const imageData = fs.readFileSync(screenshotPath);
-    
-    // Use generateText with multi-modal input (text + image)
-    const result = await generateText({
-      model: openai('gpt-4o'),
-      system: SystemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: contextPrompt,
-            },
-            {
-              type: 'image',
-              image: imageData,
-            },
-          ],
-        },
-      ],
-      tools: computerTools,
-      maxSteps: 10,
-      temperature: 0.7
+    const result = await executeAgentLoop(contextPrompt, 10, {
+      onToolCall: (toolName, args) => {
+        logger.info(`Tool called in conversation ${conversationId}: ${toolName}`);
+      },
+      onToolResult: (result) => {
+        addConversationResource(conversationId, 'toolResult', result);
+      }
     });
     
-    addConversationMessage(conversationId, 'assistant', result.text);
+    // Update the last known state based on the final result
+    if (result.finalText) {
+      const stateDesc = result.finalText.length > 150 
+        ? result.finalText.substring(0, 150) + '...'
+        : result.finalText;
+      
+      updateConversationContext(conversationId, 'lastKnownState', `After your last actions, you ${stateDesc}`);
+    }
     
-    return result.text;
+    addConversationMessage(conversationId, 'assistant', result.finalText);
+    
+    return result.finalText;
   } catch (error) {
     logger.error(`Error processing message in conversation ${conversationId}:`, error);
     const errorMessage = `I encountered an error while processing your request: ${error instanceof Error ? error.message : 'Unknown error'}. The full error has been logged for further investigation.`;
@@ -176,41 +190,6 @@ export async function processConversationMessage(
     addConversationMessage(conversationId, 'assistant', errorMessage);
     
     return errorMessage;
-  }
-}
-
-// Helper function to capture a screenshot automatically
-async function captureAutomaticScreenshot(conversationId: string) {
-  try {
-    // Create screenshots directory if it doesn't exist
-    const screenshotsDir = path.join(process.cwd(), 'screenshots');
-    fs.mkdirSync(screenshotsDir, { recursive: true });
-    
-    // Generate timestamped filename
-    const timestamp = new Date().toISOString().replace(/:/g, '-');
-    const filename = `screenshot-${timestamp}.png`;
-    const filepath = path.join(screenshotsDir, filename);
-    
-    // Capture screenshot
-    await captureScreen(undefined, filepath);
-    
-    // Resize for better token efficiency
-    const resizedPath = await resizeScreenshot(filepath, 1920, 1080);
-    
-    // Add to conversation resources
-    addConversationResource(conversationId, 'screenshot', {
-      path: resizedPath,
-      description: `Automatic screenshot captured at ${timestamp}`,
-    });
-    
-    return {
-      screenshotPath: filepath,
-      resizedScreenshotPath: resizedPath,
-      timestamp
-    };
-  } catch (error) {
-    logger.error('Error capturing automatic screenshot:', error);
-    throw error;
   }
 }
 

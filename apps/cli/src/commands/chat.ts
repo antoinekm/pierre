@@ -1,8 +1,10 @@
+// apps/cli/src/commands/chat.ts
 import { Command } from 'commander';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { sendMessage } from '../client.js';
 import { cancel, isCancel, log, outro, text } from '@clack/prompts';
+import ora from 'ora';
 
 export function registerChatCommand(program: Command): void {
   program
@@ -32,9 +34,29 @@ export function registerChatCommand(program: Command): void {
             process.exit(0);
           }
           
+          const spinner = ora('Pierre is thinking...').start();
+          
+          // Set up event listeners for tool usage and progress updates
+          const socket = global.socket;
+          
+          if (socket) {
+            socket.once('tool-call', (data) => {
+              spinner.text = `Using tool: ${data.toolName}`;
+            });
+            
+            socket.once('tool-result', (data) => {
+              spinner.text = 'Processing tool results...';
+            });
+            
+            socket.once('text', (data) => {
+              spinner.text = 'Generating response...';
+            });
+          }
+          
           const response = await sendMessage(message.toString(), conversationId);
           conversationId = response.conversationId;
           
+          spinner.stop();
           log.success(`${chalk.blue('Pierre:')}\n${response.text}`);
         } catch (error) {
           log.error(`Error in chat: ${error instanceof Error ? error.message : 'Unknown error'}`);

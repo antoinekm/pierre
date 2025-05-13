@@ -1,3 +1,4 @@
+// apps/cli/src/client.ts
 import { io, Socket } from 'socket.io-client';
 import { intro, log, outro } from '@clack/prompts';
 import { Command } from 'commander';
@@ -8,8 +9,11 @@ let socket: Socket | null = null;
 let conversationId: string | null = null;
 let hasInitialConnection = false;
 
+declare global {
+  var socket: Socket | null;
+}
+
 export async function initializeClient(program: Command): Promise<void> {
-  // Don't initialize socket connection for help/version commands or when no command is provided
   if (process.argv.length <= 2 || 
       process.argv.includes('--help') || 
       process.argv.includes('-h') ||
@@ -22,6 +26,7 @@ export async function initializeClient(program: Command): Promise<void> {
     const serverUrl = process.env.PIERRE_SERVER_URL || DEFAULT_SERVER_URL;
     
     socket = io(serverUrl);
+    global.socket = socket;
 
     const introMessage = chalk.bold(`⬢ ${program.name()} ${program.version()}`);
     
@@ -43,6 +48,18 @@ export async function initializeClient(program: Command): Promise<void> {
       log.error(`Failed to connect to server: ${error.message}`);
       outro('Please check if the server is running and try again.');
       process.exit(1);
+    });
+    
+    socket.on('text', (data) => {
+      // This event is just for progress updates, no need to display
+    });
+    
+    socket.on('tool-call', (data) => {
+      log.info(chalk.yellow(`Tool called: ${data.toolName}`));
+    });
+    
+    socket.on('tool-result', (data) => {
+      log.info(chalk.green(`Tool execution completed`));
     });
     
     socket.on('disconnect', (reason) => {
@@ -82,6 +99,7 @@ export async function closeClient(): Promise<void> {
   if (socket) {
     socket.disconnect();
     socket = null;
+    global.socket = null;
     conversationId = null;
   }
 }
@@ -119,6 +137,6 @@ export async function sendMessage(message: string, convId: string | null = null)
     
     setTimeout(() => {
       reject(new Error('Response timeout'));
-    }, 30000);
+    }, 120000); // 2 minute timeout for multi-step processes
   });
 }
